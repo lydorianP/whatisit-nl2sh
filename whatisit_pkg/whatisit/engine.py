@@ -226,13 +226,32 @@ def _is_our_server(pid: int) -> bool:
     Without this, `whatisit stop` blindly SIGTERMs whatever now owns a recycled
     pid. On a long-lived shared node that is somebody's -- possibly your own --
     unrelated process.
+
+    We check two things: the cmdline must contain "llama-server", AND the
+    process must be running from our state directory (or have our model path
+    in its args). This prevents matching an unrelated llama-server that happens
+    to share the same PID after a reboot.
     """
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         cmdline = raw.replace(b"\x00", b" ").decode(errors="replace")
     except OSError:
         return False
-    return "llama-server" in cmdline
+    if "llama-server" not in cmdline:
+        return False
+    # Also verify the process is associated with our state dir. We store our
+    # state dir path in the pid file as a second line; if it matches, we are
+    # confident this is our server.
+    pid_f = _state_dir() / "server.pid"
+    if pid_f.exists():
+        lines = pid_f.read_text().splitlines()
+        if len(lines) >= 2 and lines[1].strip() == str(_state_dir()):
+            return True
+    # Fallback: check if the model path in cmdline matches our known model.
+    our_model = cfg_mod.find_model()
+    if our_model and str(our_model) in cmdline:
+        return True
+    return False
 
 
 def stop_server() -> bool:
@@ -288,7 +307,9 @@ def start_server(model: Path, server_bin: Path, threads: int,
         lf.write(f"\n=== start {time.strftime('%F %T')}: {' '.join(cmd)}\n".encode())
         proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
                                 env=_runtime_env(), start_new_session=True)
-    _write_private(sd / "server.pid", str(proc.pid))
+    # Store both pid and state dir so _is_our_server can disambiguate across
+    # processes that happen to share a recycled PID.
+    _write_private(sd / "server.pid", f"{proc.pid}\n{sd}")
     if port:
         _write_private(_port_file(), str(port))
 
@@ -313,7 +334,7 @@ def _post(port: int, body: dict) -> list[str]:
 
 
 def _query_server(port: int, prompt: str, cfg: dict, n: int,
-                  system: str | None = None) -> list[str]:
+                  system: str | None = None, grammar: str | None = None) -> list[str]:
     """Greedy answer first, then sampled alternatives.
 
     Getting this wrong was visible in real use: asking for 3 candidates used to
@@ -337,25 +358,32 @@ def _query_server(port: int, prompt: str, cfg: dict, n: int,
         "repeat_penalty": cfg.get("repeat_penalty", 1.08),
         "repeat_last_n": 64,
     }
+    if grammar:
+        base["grammar"] = grammar
     out = _post(port, {**base, "temperature": cfg.get("temperature", 0.0)})
     if n <= 1:
         return out
     # Sampling is required for *distinct* alternatives; greedy repeats itself.
     try:
-        out += _post(port, {**base, "n": n - 1,
-                            "temperature": max(0.6, float(cfg.get("temperature") or 0)),
-                            "top_p": 0.95})
+        alt = {**base, "n": n - 1,
+               "temperature": max(0.6, float(cfg.get("temperature") or 0)),
+               "top_p": 0.95}
+        if grammar:
+            alt["grammar"] = grammar
+        out += _post(port, alt)
     except Exception:
         pass  # alternatives are a bonus; never lose the greedy answer over them
     return out
 
 
 def _query_oneshot(model: Path, cli_bin: Path, prompt: str, cfg: dict, threads: int,
-                   system: str | None = None) -> list[str]:
+                   system: str | None = None, grammar: str | None = None) -> list[str]:
     cmd = [str(cli_bin), "-m", str(model), "-sys", system or cfg_mod.SYSTEM_PROMPT, "-p", prompt,
            "-st", "--no-display-prompt", "--no-warmup",
            "--temp", str(cfg.get("temperature", 0.0)),
            "-n", str(cfg.get("max_tokens", 64)), "-t", str(threads)]
+    if grammar:
+        cmd.extend(["--grammar", grammar])
     p = subprocess.run(cmd, capture_output=True, text=True, env=_runtime_env(), timeout=300)
     if p.returncode != 0:
         raise RuntimeError(f"llama-cli rc={p.returncode}: {p.stderr[-400:]}")
@@ -426,17 +454,30 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
     # placeholder / wrong-tool failures. cfg["host_context"]=false disables it.
     system, user_msg = hostctx.build(prompt, enabled=cfg.get("host_context", True))
 
+    # GBNF grammar: constrain the model to emit only commands using the host's
+    # package manager. This is a hard constraint that overrides training bias.
+    host_pkg = "unknown"
+    grammar = None
+    if cfg.get("host_context", True):
+        try:
+            # stable_facts() is cached after the first call inside hostctx.build(),
+            # so this second call is free.
+            host_pkg = hostctx.stable_facts().get("pkg", "unknown")
+            grammar = hostctx.grammar_for_pkg(host_pkg)
+        except OSError:
+            pass
+
     t0 = time.time()
     if server_bin is not None:
         port = start_server(model, server_bin, threads, quiet=quiet)
-        raws = _query_server(port, user_msg, cfg, n, system=system)
+        raws = _query_server(port, user_msg, cfg, n, system=system, grammar=grammar)
         mode = "server"
     else:
         cli = cfg_mod.find_llama_cli()
         if cli is None:
             raise FileNotFoundError(
                 "neither llama-server nor llama-cli found -- run `whatisit doctor`")
-        raws = _query_oneshot(model, cli, user_msg, cfg, threads, system=system)
+        raws = _query_oneshot(model, cli, user_msg, cfg, threads, system=system, grammar=grammar)
         mode = "oneshot"
 
     cmds, seen = [], set()
@@ -444,6 +485,7 @@ def generate(prompt: str, cfg: dict, n: int = 1, force_oneshot: bool = False,
         c = extract(raw)
         if not c or c in seen:
             continue
+        c = hostctx.postprocess_command(c, host_pkg) if host_pkg != "unknown" else c
         # A generation that stopped because it ran out of budget is not a
         # finished command, and must not be presented as one. The observed case
         # was `zip -r -9 -q -m -j -0 -1 -1 ...`: truncated mid-flag-spam, yet it

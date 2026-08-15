@@ -184,7 +184,7 @@ class TestGenerateDiscardsTruncatedCandidates:
     def test_length_finish_reason_is_dropped(self, monkeypatch, tmp_path):
         self._fake_cfg_and_model(monkeypatch, tmp_path)
 
-        def fake_query_server(port, prompt, cfg, n, system=None):
+        def fake_query_server(port, prompt, cfg, n, system=None, grammar=None):
             return [
                 ("zip -r -9 -m -j -0 -1 -1 -1", "length"),   # truncated, has -m: drop
                 ("zip -r archive.zip .", "stop"),             # clean: keep
@@ -198,7 +198,7 @@ class TestGenerateDiscardsTruncatedCandidates:
     def test_degenerate_candidate_is_also_dropped_even_if_finished(self, monkeypatch, tmp_path):
         self._fake_cfg_and_model(monkeypatch, tmp_path)
 
-        def fake_query_server(port, prompt, cfg, n, system=None):
+        def fake_query_server(port, prompt, cfg, n, system=None, grammar=None):
             return [
                 ("zip -r -9 -q -n -j -0 -9 -n -j -0 -9 -n -j -0 -9 -n -j -0 a.zip .", "stop"),
                 ("zip -r archive.zip .", "stop"),
@@ -211,7 +211,7 @@ class TestGenerateDiscardsTruncatedCandidates:
     def test_duplicate_candidates_are_deduplicated(self, monkeypatch, tmp_path):
         self._fake_cfg_and_model(monkeypatch, tmp_path)
 
-        def fake_query_server(port, prompt, cfg, n, system=None):
+        def fake_query_server(port, prompt, cfg, n, system=None, grammar=None):
             return [("ls -la", "stop"), ("ls -la", "stop")]
         monkeypatch.setattr(engine, "_query_server", fake_query_server)
 
@@ -228,3 +228,12 @@ class _FakeHostCtx:
     @staticmethod
     def build(prompt, enabled=True, cwd=None):
         return ("SYSTEM PROMPT", prompt)
+    @staticmethod
+    def stable_facts():
+        return {"pkg": "unknown"}
+    @staticmethod
+    def postprocess_command(cmd, pkg_mgr):
+        return cmd
+    @staticmethod
+    def grammar_for_pkg(pkg_mgr):
+        return None
